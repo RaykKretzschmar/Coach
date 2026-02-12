@@ -42,7 +42,9 @@ DEDUP_THRESHOLD = float(
 MAX_HISTORY_MESSAGES = int(
     os.getenv("MAX_HISTORY_MESSAGES", "20")
 )  # conversation history cap
-ENABLE_BACKFILL_ON_STARTUP = os.getenv("ENABLE_BACKFILL_ON_STARTUP", "false").lower() in (
+ENABLE_BACKFILL_ON_STARTUP = os.getenv(
+    "ENABLE_BACKFILL_ON_STARTUP", "false"
+).lower() in (
     "true",
     "1",
     "yes",
@@ -100,7 +102,7 @@ def _get_connection() -> sqlite3.Connection:
 
 def init_db(run_backfill: bool = False) -> None:
     """Create the long-term *memories* table if it doesn't exist yet.
-    
+
     Args:
         run_backfill: If True, run the backfill process. Otherwise, only run
                       if ENABLE_BACKFILL_ON_STARTUP is set.
@@ -117,11 +119,13 @@ def init_db(run_backfill: bool = False) -> None:
         )
         conn.commit()
     print("[db] memories table ready.")
-    
+
     if run_backfill or ENABLE_BACKFILL_ON_STARTUP:
         _backfill_vector_store()
     else:
-        print("[db] backfill skipped (use --backfill flag or set ENABLE_BACKFILL_ON_STARTUP=true)")
+        print(
+            "[db] backfill skipped (use --backfill flag or set ENABLE_BACKFILL_ON_STARTUP=true)"
+        )
 
 
 def _get_existing_vector_ids(batch_size: int = 1000) -> set[str]:
@@ -148,7 +152,7 @@ def _get_existing_vector_ids(batch_size: int = 1000) -> set[str]:
 
 def _backfill_vector_store() -> None:
     """Ensure every row in the SQLite memories table is also in Chroma.
-    
+
     Performs backfill with batching and rate limiting to avoid overwhelming
     the embedding API and reduce startup costs.
     """
@@ -156,43 +160,56 @@ def _backfill_vector_store() -> None:
     print("[vector] starting backfill process...")
     with _get_connection() as conn:
         rows = conn.execute("SELECT id, fact, created_at FROM memories;").fetchall()
-    
+
     if not rows:
         print("[vector] no memories found in SQLite, backfill complete.")
         return
-    
+
     print(f"[vector] found {len(rows)} total memories in SQLite")
     existing_ids = _get_existing_vector_ids()
     print(f"[vector] found {len(existing_ids)} existing memories in Chroma")
-    
+
     new_rows = [(rid, fact, ts) for rid, fact, ts in rows if rid not in existing_ids]
     if not new_rows:
         print("[vector] all memories already in Chroma, backfill complete.")
         return
-    
+
     total_to_backfill = len(new_rows)
-    print(f"[vector] backfilling {total_to_backfill} missing memories in batches of {BACKFILL_BATCH_SIZE}...")
-    
+    print(
+        f"[vector] backfilling {total_to_backfill} missing memories in batches of {BACKFILL_BATCH_SIZE}..."
+    )
+
     # Process in batches to avoid overwhelming the API
     for i in range(0, total_to_backfill, BACKFILL_BATCH_SIZE):
         batch = new_rows[i : i + BACKFILL_BATCH_SIZE]
         batch_num = (i // BACKFILL_BATCH_SIZE) + 1
-        total_batches = (total_to_backfill + BACKFILL_BATCH_SIZE - 1) // BACKFILL_BATCH_SIZE
-        
-        print(f"[vector] processing batch {batch_num}/{total_batches} ({len(batch)} memories)...")
-        
+        total_batches = (
+            total_to_backfill + BACKFILL_BATCH_SIZE - 1
+        ) // BACKFILL_BATCH_SIZE
+
+        print(
+            f"[vector] processing batch {batch_num}/{total_batches} ({len(batch)} memories)..."
+        )
+
         vector_store.add_texts(
             texts=[fact for _, fact, _ in batch],
             ids=[rid for rid, _, _ in batch],
             metadatas=[{"created_at": ts} for _, _, ts in batch],
         )
-        
+
         # Rate limiting between batches (except for the last batch)
-        if i + BACKFILL_BATCH_SIZE < total_to_backfill and BACKFILL_RATE_LIMIT_DELAY > 0:
-            print(f"[vector] rate limiting: waiting {BACKFILL_RATE_LIMIT_DELAY}s before next batch...")
+        if (
+            i + BACKFILL_BATCH_SIZE < total_to_backfill
+            and BACKFILL_RATE_LIMIT_DELAY > 0
+        ):
+            print(
+                f"[vector] rate limiting: waiting {BACKFILL_RATE_LIMIT_DELAY}s before next batch..."
+            )
             time.sleep(BACKFILL_RATE_LIMIT_DELAY)
-    
-    print(f"[vector] ✓ backfill complete: added {total_to_backfill} memories to Chroma.")
+
+    print(
+        f"[vector] ✓ backfill complete: added {total_to_backfill} memories to Chroma."
+    )
 
 
 # ── Memory tools ─────────────────────────────────────────────────────────────
@@ -379,7 +396,7 @@ def main() -> None:
         help="Force backfill of vector store from SQLite on startup",
     )
     args = parser.parse_args()
-    
+
     init_db(run_backfill=args.backfill)
 
     graph = build_graph()
