@@ -76,13 +76,34 @@ def init_db() -> None:
     _backfill_vector_store()
 
 
+def _get_existing_vector_ids(batch_size: int = 1000) -> set[str]:
+    """Return all existing ids from the Chroma collection using pagination.
+
+    This avoids loading the entire collection into memory in a single call.
+    """
+    existing_ids: set[str] = set()
+    offset = 0
+    while True:
+        # Only request ids to minimize data transferred/loaded.
+        batch = vector_store.get(limit=batch_size, offset=offset, include=["ids"])
+        ids = batch.get("ids") or []
+        if not ids:
+            break
+        existing_ids.update(ids)
+        # If we received fewer ids than requested, we've reached the end.
+        if len(ids) < batch_size:
+            break
+        offset += batch_size
+    return existing_ids
+
+
 def _backfill_vector_store() -> None:
     """Ensure every row in the SQLite memories table is also in Chroma."""
     with _get_connection() as conn:
         rows = conn.execute("SELECT id, fact, created_at FROM memories;").fetchall()
     if not rows:
         return
-    existing_ids = set(vector_store.get()["ids"])
+    existing_ids = _get_existing_vector_ids()
     new_rows = [(rid, fact, ts) for rid, fact, ts in rows if rid not in existing_ids]
     if not new_rows:
         return
