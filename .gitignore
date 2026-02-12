@@ -5,6 +5,7 @@
 *.db
 *.db-wal
 *.db-shm
+chroma_db/
 
 # Python
 __pycache__/
