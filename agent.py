@@ -18,8 +18,9 @@ from datetime import datetime, timezone
 from typing import TypedDict
 
 from dotenv import load_dotenv
+from langchain_chroma import Chroma
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
 
@@ -30,8 +31,22 @@ load_dotenv()  # reads OPENAI_API_KEY (and optionally MODEL_NAME) from .env
 DB_PATH = os.getenv("MENTOR_DB", "mentor.db")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
 THREAD_ID = os.getenv("THREAD_ID", "default-thread")
+CHROMA_DIR = os.getenv("CHROMA_DIR", "chroma_db")  # persistent vector store
+MEMORY_TOP_K = int(os.getenv("MEMORY_TOP_K", "10"))  # max memories per turn
+DEDUP_THRESHOLD = float(
+    os.getenv("DEDUP_THRESHOLD", "0.92")
+)  # similarity above this → duplicate
+MAX_HISTORY_MESSAGES = int(
+    os.getenv("MAX_HISTORY_MESSAGES", "20")
+)  # conversation history cap
 
 llm = ChatOpenAI(model=MODEL_NAME, temperature=0.7)
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+vector_store = Chroma(
+    collection_name="memories",
+    embedding_function=embeddings,
+    persist_directory=CHROMA_DIR,
+)
 
 
 # ── Database helpers ─────────────────────────────────────────────────────────
@@ -58,34 +73,68 @@ def init_db() -> None:
         )
         conn.commit()
     print("[db] memories table ready.")
+    _backfill_vector_store()
+
+
+def _backfill_vector_store() -> None:
+    """Ensure every row in the SQLite memories table is also in Chroma."""
+    with _get_connection() as conn:
+        rows = conn.execute("SELECT id, fact, created_at FROM memories;").fetchall()
+    if not rows:
+        return
+    existing_ids = set(vector_store.get()["ids"])
+    new_rows = [(rid, fact, ts) for rid, fact, ts in rows if rid not in existing_ids]
+    if not new_rows:
+        return
+    vector_store.add_texts(
+        texts=[fact for _, fact, _ in new_rows],
+        ids=[rid for rid, _, _ in new_rows],
+        metadatas=[{"created_at": ts} for _, _, ts in new_rows],
+    )
+    print(f"[vector] back-filled {len(new_rows)} memories into Chroma.")
 
 
 # ── Memory tools ─────────────────────────────────────────────────────────────
 
 
 def save_memory(fact: str) -> str:
-    """Insert a single fact into the memories table. Returns the new row id."""
+    """Insert a fact into SQLite + Chroma, skipping near-duplicates."""
+    # ── Deduplication check via vector similarity ────────────────────────
+    hits = vector_store.similarity_search_with_relevance_scores(fact, k=1)
+    if hits:
+        _doc, score = hits[0]
+        if score >= DEDUP_THRESHOLD:
+            print(f"[memory] ⏭  duplicate (score={score:.2f}), skipped: {fact!r}")
+            return ""  # near-duplicate already exists
+
     row_id = uuid.uuid4().hex[:12]
     now = datetime.now(timezone.utc).isoformat()
+
+    # SQLite (source of truth)
     with _get_connection() as conn:
         conn.execute(
             "INSERT INTO memories (id, fact, created_at) VALUES (?, ?, ?);",
             (row_id, fact, now),
         )
         conn.commit()
+
+    # Chroma (vector index)
+    vector_store.add_texts(
+        texts=[fact],
+        ids=[row_id],
+        metadatas=[{"created_at": now}],
+    )
+
     print(f"[memory] 💾  saved: {fact!r}")
     return row_id
 
 
-def get_all_memories() -> str:
-    """Return every stored fact as a numbered, human-readable string."""
-    with _get_connection() as conn:
-        rows = conn.execute(
-            "SELECT fact, created_at FROM memories ORDER BY created_at;"
-        ).fetchall()
-    if not rows:
+def search_memories(query: str, k: int = MEMORY_TOP_K) -> str:
+    """Return the top-k memories most relevant to *query*."""
+    results = vector_store.similarity_search(query, k=k)
+    if not results:
         return "(no memories stored yet)"
-    lines = [f"  {i}. {fact}  (saved {ts})" for i, (fact, ts) in enumerate(rows, 1)]
+    lines = [f"  {i}. {doc.page_content}" for i, doc in enumerate(results, 1)]
     return "\n".join(lines)
 
 
@@ -140,9 +189,12 @@ REFLECTOR_PROMPT = textwrap.dedent(
 
 
 def load_memories(state: AgentState) -> dict:
-    """Node 1 – fetch all stored memories and put them in state."""
-    memories = get_all_memories()
-    print(f"[node] load_memories → {len(memories)} chars")
+    """Node 1 – retrieve only the memories relevant to the latest message."""
+    # Use the most recent user message as the search query.
+    user_msgs = [m for m in state["messages"] if isinstance(m, HumanMessage)]
+    query = user_msgs[-1].content if user_msgs else ""
+    memories = search_memories(query)
+    print(f"[node] load_memories → {len(memories)} chars (top-{MEMORY_TOP_K})")
     return {"current_memories": memories}
 
 
@@ -231,6 +283,10 @@ def main() -> None:
             past_messages: list[BaseMessage] = []
             if checkpoint and "channel_values" in checkpoint:
                 past_messages = checkpoint["channel_values"].get("messages", [])
+
+            # Cap conversation history to avoid unbounded token growth.
+            if len(past_messages) > MAX_HISTORY_MESSAGES:
+                past_messages = past_messages[-MAX_HISTORY_MESSAGES:]
 
             # Append the new human message.
             messages = past_messages + [HumanMessage(content=user_input)]
