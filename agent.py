@@ -10,9 +10,12 @@ the script and pick up where you left off.
 
 from __future__ import annotations
 
+import argparse
 import os
 import sqlite3
+import sys
 import textwrap
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, TypedDict
@@ -39,14 +42,50 @@ DEDUP_THRESHOLD = float(
 MAX_HISTORY_MESSAGES = int(
     os.getenv("MAX_HISTORY_MESSAGES", "20")
 )  # conversation history cap
-
-llm = ChatOpenAI(model=MODEL_NAME, temperature=0.7)
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-vector_store = Chroma(
-    collection_name="memories",
-    embedding_function=embeddings,
-    persist_directory=CHROMA_DIR,
+ENABLE_BACKFILL_ON_STARTUP = os.getenv("ENABLE_BACKFILL_ON_STARTUP", "false").lower() in (
+    "true",
+    "1",
+    "yes",
 )
+BACKFILL_BATCH_SIZE = int(os.getenv("BACKFILL_BATCH_SIZE", "100"))
+BACKFILL_RATE_LIMIT_DELAY = float(
+    os.getenv("BACKFILL_RATE_LIMIT_DELAY", "1.0")
+)  # seconds between batches
+
+# ── Lazy initialization of global objects ───────────────────────────────────
+# These are initialized on first use to avoid requiring API keys for --help
+
+_llm = None
+_embeddings = None
+_vector_store = None
+
+
+def get_llm() -> ChatOpenAI:
+    """Lazy initialization of LLM client."""
+    global _llm
+    if _llm is None:
+        _llm = ChatOpenAI(model=MODEL_NAME, temperature=0.7)
+    return _llm
+
+
+def get_embeddings() -> OpenAIEmbeddings:
+    """Lazy initialization of embeddings client."""
+    global _embeddings
+    if _embeddings is None:
+        _embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    return _embeddings
+
+
+def get_vector_store() -> Chroma:
+    """Lazy initialization of vector store."""
+    global _vector_store
+    if _vector_store is None:
+        _vector_store = Chroma(
+            collection_name="memories",
+            embedding_function=get_embeddings(),
+            persist_directory=CHROMA_DIR,
+        )
+    return _vector_store
 
 
 # ── Database helpers ─────────────────────────────────────────────────────────
@@ -59,8 +98,13 @@ def _get_connection() -> sqlite3.Connection:
     return conn
 
 
-def init_db() -> None:
-    """Create the long-term *memories* table if it doesn't exist yet."""
+def init_db(run_backfill: bool = False) -> None:
+    """Create the long-term *memories* table if it doesn't exist yet.
+    
+    Args:
+        run_backfill: If True, run the backfill process. Otherwise, only run
+                      if ENABLE_BACKFILL_ON_STARTUP is set.
+    """
     with _get_connection() as conn:
         conn.execute(
             """
@@ -73,7 +117,11 @@ def init_db() -> None:
         )
         conn.commit()
     print("[db] memories table ready.")
-    _backfill_vector_store()
+    
+    if run_backfill or ENABLE_BACKFILL_ON_STARTUP:
+        _backfill_vector_store()
+    else:
+        print("[db] backfill skipped (use --backfill flag or set ENABLE_BACKFILL_ON_STARTUP=true)")
 
 
 def _get_existing_vector_ids(batch_size: int = 1000) -> set[str]:
@@ -81,6 +129,7 @@ def _get_existing_vector_ids(batch_size: int = 1000) -> set[str]:
 
     This avoids loading the entire collection into memory in a single call.
     """
+    vector_store = get_vector_store()
     existing_ids: set[str] = set()
     offset = 0
     while True:
@@ -98,21 +147,52 @@ def _get_existing_vector_ids(batch_size: int = 1000) -> set[str]:
 
 
 def _backfill_vector_store() -> None:
-    """Ensure every row in the SQLite memories table is also in Chroma."""
+    """Ensure every row in the SQLite memories table is also in Chroma.
+    
+    Performs backfill with batching and rate limiting to avoid overwhelming
+    the embedding API and reduce startup costs.
+    """
+    vector_store = get_vector_store()
+    print("[vector] starting backfill process...")
     with _get_connection() as conn:
         rows = conn.execute("SELECT id, fact, created_at FROM memories;").fetchall()
+    
     if not rows:
+        print("[vector] no memories found in SQLite, backfill complete.")
         return
+    
+    print(f"[vector] found {len(rows)} total memories in SQLite")
     existing_ids = _get_existing_vector_ids()
+    print(f"[vector] found {len(existing_ids)} existing memories in Chroma")
+    
     new_rows = [(rid, fact, ts) for rid, fact, ts in rows if rid not in existing_ids]
     if not new_rows:
+        print("[vector] all memories already in Chroma, backfill complete.")
         return
-    vector_store.add_texts(
-        texts=[fact for _, fact, _ in new_rows],
-        ids=[rid for rid, _, _ in new_rows],
-        metadatas=[{"created_at": ts} for _, _, ts in new_rows],
-    )
-    print(f"[vector] back-filled {len(new_rows)} memories into Chroma.")
+    
+    total_to_backfill = len(new_rows)
+    print(f"[vector] backfilling {total_to_backfill} missing memories in batches of {BACKFILL_BATCH_SIZE}...")
+    
+    # Process in batches to avoid overwhelming the API
+    for i in range(0, total_to_backfill, BACKFILL_BATCH_SIZE):
+        batch = new_rows[i : i + BACKFILL_BATCH_SIZE]
+        batch_num = (i // BACKFILL_BATCH_SIZE) + 1
+        total_batches = (total_to_backfill + BACKFILL_BATCH_SIZE - 1) // BACKFILL_BATCH_SIZE
+        
+        print(f"[vector] processing batch {batch_num}/{total_batches} ({len(batch)} memories)...")
+        
+        vector_store.add_texts(
+            texts=[fact for _, fact, _ in batch],
+            ids=[rid for rid, _, _ in batch],
+            metadatas=[{"created_at": ts} for _, _, ts in batch],
+        )
+        
+        # Rate limiting between batches (except for the last batch)
+        if i + BACKFILL_BATCH_SIZE < total_to_backfill and BACKFILL_RATE_LIMIT_DELAY > 0:
+            print(f"[vector] rate limiting: waiting {BACKFILL_RATE_LIMIT_DELAY}s before next batch...")
+            time.sleep(BACKFILL_RATE_LIMIT_DELAY)
+    
+    print(f"[vector] ✓ backfill complete: added {total_to_backfill} memories to Chroma.")
 
 
 # ── Memory tools ─────────────────────────────────────────────────────────────
@@ -120,6 +200,7 @@ def _backfill_vector_store() -> None:
 
 def save_memory(fact: str) -> Optional[str]:
     """Insert a fact into SQLite + Chroma, skipping near-duplicates."""
+    vector_store = get_vector_store()
     # ── Deduplication check via vector similarity ────────────────────────
     hits = vector_store.similarity_search_with_relevance_scores(fact, k=1)
     if hits:
@@ -152,6 +233,7 @@ def save_memory(fact: str) -> Optional[str]:
 
 def search_memories(query: str, k: int = MEMORY_TOP_K) -> str:
     """Return the top-k memories most relevant to *query*."""
+    vector_store = get_vector_store()
     results = vector_store.similarity_search(query, k=k)
     if not results:
         return "(no memories stored yet)"
@@ -221,6 +303,7 @@ def load_memories(state: AgentState) -> dict:
 
 def agent(state: AgentState) -> dict:
     """Node 2 – the mentor chatbot. Produces a reply for the user."""
+    llm = get_llm()
     system = SystemMessage(
         content=SYSTEM_PROMPT.format(memories=state["current_memories"])
     )
@@ -231,6 +314,7 @@ def agent(state: AgentState) -> dict:
 
 def memory_reflector(state: AgentState) -> dict:
     """Node 3 – separate LLM call that decides whether to save a new memory."""
+    llm = get_llm()
     # Build a mini-context with just the last user msg + assistant reply.
     recent = state["messages"][-2:]  # [HumanMessage, AIMessage]
     exchange = "\n".join(f"{m.type.upper()}: {m.content}" for m in recent)
@@ -273,7 +357,30 @@ def build_graph() -> StateGraph:
 
 
 def main() -> None:
-    init_db()
+    parser = argparse.ArgumentParser(
+        description="Personal Mentor Chatbot with LangGraph",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent(
+            """\
+            Examples:
+              python agent.py              # Start the chatbot (backfill only if ENABLE_BACKFILL_ON_STARTUP=true)
+              python agent.py --backfill   # Run backfill maintenance and start chatbot
+              
+            Environment variables:
+              ENABLE_BACKFILL_ON_STARTUP - Auto-run backfill on startup (default: false)
+              BACKFILL_BATCH_SIZE        - Number of memories per batch (default: 100)
+              BACKFILL_RATE_LIMIT_DELAY  - Seconds between batches (default: 1.0)
+            """
+        ),
+    )
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="Force backfill of vector store from SQLite on startup",
+    )
+    args = parser.parse_args()
+    
+    init_db(run_backfill=args.backfill)
 
     graph = build_graph()
 
