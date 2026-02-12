@@ -15,7 +15,7 @@ import sqlite3
 import textwrap
 import uuid
 from datetime import datetime, timezone
-from typing import TypedDict
+from typing import Optional, TypedDict
 
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
@@ -118,7 +118,7 @@ def _backfill_vector_store() -> None:
 # ── Memory tools ─────────────────────────────────────────────────────────────
 
 
-def save_memory(fact: str) -> str:
+def save_memory(fact: str) -> Optional[str]:
     """Insert a fact into SQLite + Chroma, skipping near-duplicates."""
     # ── Deduplication check via vector similarity ────────────────────────
     hits = vector_store.similarity_search_with_relevance_scores(fact, k=1)
@@ -126,7 +126,7 @@ def save_memory(fact: str) -> str:
         _doc, score = hits[0]
         if score >= DEDUP_THRESHOLD:
             print(f"[memory] ⏭  duplicate (score={score:.2f}), skipped: {fact!r}")
-            return ""  # near-duplicate already exists
+            return None  # near-duplicate already exists
 
     row_id = uuid.uuid4().hex[:12]
     now = datetime.now(timezone.utc).isoformat()
