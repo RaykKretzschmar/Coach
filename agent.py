@@ -11,7 +11,9 @@ the script and pick up where you left off.
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import sqlite3
 import sys
 import textwrap
@@ -19,22 +21,38 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, TypedDict
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-load_dotenv()  # reads OPENAI_API_KEY (and optionally MODEL_NAME) from .env
+load_dotenv()  # reads local Ollama configuration from .env
 
 DB_PATH = os.getenv("MENTOR_DB", "mentor.db")
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+MODEL_NAME = os.getenv("MODEL_NAME", "gemma4:26b")
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "nomic-embed-text")
+MODEL_TEMPERATURE = float(os.getenv("MODEL_TEMPERATURE", "1.0"))
+OLLAMA_TOP_P = float(os.getenv("OLLAMA_TOP_P", "0.95"))
+OLLAMA_TOP_K = int(os.getenv("OLLAMA_TOP_K", "64"))
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "1024"))
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
+SKIP_OLLAMA_MODEL_CHECK = os.getenv("SKIP_OLLAMA_MODEL_CHECK", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 THREAD_ID = os.getenv("THREAD_ID", "default-thread")
 CHROMA_DIR = os.getenv("CHROMA_DIR", "chroma_db")  # persistent vector store
+CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "memories_local")
 MEMORY_TOP_K = int(os.getenv("MEMORY_TOP_K", "10"))  # max memories per turn
 DEDUP_THRESHOLD = float(
     os.getenv("DEDUP_THRESHOLD", "0.92")
@@ -55,26 +73,38 @@ BACKFILL_RATE_LIMIT_DELAY = float(
 )  # seconds between batches
 
 # ── Lazy initialization of global objects ───────────────────────────────────
-# These are initialized on first use to avoid requiring API keys for --help
+# These are initialized on first use to avoid requiring local models for --help.
 
 _llm = None
 _embeddings = None
 _vector_store = None
 
 
-def get_llm() -> ChatOpenAI:
+def get_llm() -> ChatOllama:
     """Lazy initialization of LLM client."""
     global _llm
     if _llm is None:
-        _llm = ChatOpenAI(model=MODEL_NAME, temperature=0.7)
+        _llm = ChatOllama(
+            model=MODEL_NAME,
+            base_url=OLLAMA_BASE_URL,
+            temperature=MODEL_TEMPERATURE,
+            top_p=OLLAMA_TOP_P,
+            top_k=OLLAMA_TOP_K,
+            num_ctx=OLLAMA_NUM_CTX,
+            num_predict=OLLAMA_NUM_PREDICT,
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
     return _llm
 
 
-def get_embeddings() -> OpenAIEmbeddings:
+def get_embeddings() -> OllamaEmbeddings:
     """Lazy initialization of embeddings client."""
     global _embeddings
     if _embeddings is None:
-        _embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        _embeddings = OllamaEmbeddings(
+            model=EMBEDDING_MODEL_NAME,
+            base_url=OLLAMA_BASE_URL,
+        )
     return _embeddings
 
 
@@ -83,11 +113,63 @@ def get_vector_store() -> Chroma:
     global _vector_store
     if _vector_store is None:
         _vector_store = Chroma(
-            collection_name="memories",
+            collection_name=CHROMA_COLLECTION,
             embedding_function=get_embeddings(),
             persist_directory=CHROMA_DIR,
         )
     return _vector_store
+
+
+def _ollama_api_url(path: str) -> str:
+    """Build an Ollama API URL from the configured base URL."""
+    return f"{OLLAMA_BASE_URL.rstrip('/')}{path}"
+
+
+def _get_installed_ollama_models() -> set[str]:
+    """Return model names visible to the local Ollama server."""
+    request = Request(_ollama_api_url("/api/tags"), method="GET")
+    with urlopen(request, timeout=5) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return {model.get("name", "") for model in payload.get("models", [])}
+
+
+def is_ollama_model_installed(model_name: str, installed_models: set[str]) -> bool:
+    """Return True when Ollama has the model, accepting implicit :latest tags."""
+    if model_name in installed_models:
+        return True
+    if ":" not in model_name and f"{model_name}:latest" in installed_models:
+        return True
+    return False
+
+
+def ensure_local_models_available() -> None:
+    """Fail early with local setup guidance if Ollama is not ready."""
+    if SKIP_OLLAMA_MODEL_CHECK:
+        return
+
+    try:
+        installed_models = _get_installed_ollama_models()
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "Ollama is not reachable at "
+            f"{OLLAMA_BASE_URL!r}. Start Ollama, then rerun the app.\n"
+            "On macOS with Homebrew: brew install ollama && brew services start ollama"
+        ) from exc
+
+    required_models = [MODEL_NAME, EMBEDDING_MODEL_NAME]
+    missing_models = [
+        name
+        for name in required_models
+        if not is_ollama_model_installed(name, installed_models)
+    ]
+    if missing_models:
+        pull_commands = "\n".join(f"  ollama pull {name}" for name in missing_models)
+        raise RuntimeError(
+            "Missing local Ollama model(s): "
+            f"{', '.join(missing_models)}\n"
+            "Install them with:\n"
+            f"{pull_commands}"
+        )
 
 
 # ── Database helpers ─────────────────────────────────────────────────────────
@@ -138,7 +220,7 @@ def _get_existing_vector_ids(batch_size: int = 1000) -> set[str]:
     offset = 0
     while True:
         # Only request ids to minimize data transferred/loaded.
-        batch = vector_store.get(limit=batch_size, offset=offset, include=["ids"])
+        batch = vector_store.get(limit=batch_size, offset=offset, include=[])
         ids = batch.get("ids") or []
         if not ids:
             break
@@ -154,7 +236,7 @@ def _backfill_vector_store() -> None:
     """Ensure every row in the SQLite memories table is also in Chroma.
 
     Performs backfill with batching and rate limiting to avoid overwhelming
-    the embedding API and reduce startup costs.
+    the local embedding model.
     """
     vector_store = get_vector_store()
     print("[vector] starting backfill process...")
@@ -179,7 +261,7 @@ def _backfill_vector_store() -> None:
         f"[vector] backfilling {total_to_backfill} missing memories in batches of {BACKFILL_BATCH_SIZE}..."
     )
 
-    # Process in batches to avoid overwhelming the API
+    # Process in batches to avoid overwhelming the local embedding model.
     for i in range(0, total_to_backfill, BACKFILL_BATCH_SIZE):
         batch = new_rows[i : i + BACKFILL_BATCH_SIZE]
         batch_num = (i // BACKFILL_BATCH_SIZE) + 1
@@ -258,6 +340,72 @@ def search_memories(query: str, k: int = MEMORY_TOP_K) -> str:
     return "\n".join(lines)
 
 
+def list_recent_memories(limit: int = 12) -> list[dict[str, str]]:
+    """Return recent memories from SQLite for the web UI."""
+    with _get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, fact, created_at
+            FROM memories
+            ORDER BY created_at DESC
+            LIMIT ?;
+            """,
+            (limit,),
+        ).fetchall()
+    return [
+        {"id": row_id, "fact": fact, "created_at": created_at}
+        for row_id, fact, created_at in rows
+    ]
+
+
+def update_memory(memory_id: str, fact: str) -> dict[str, str]:
+    """Update a memory in SQLite and refresh its Chroma vector."""
+    normalized_fact = fact.strip()
+    if not normalized_fact:
+        raise ValueError("Memory text is required.")
+
+    with _get_connection() as conn:
+        row = conn.execute(
+            "SELECT created_at FROM memories WHERE id = ?;",
+            (memory_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Memory not found: {memory_id}")
+
+        created_at = row[0]
+        conn.execute(
+            "UPDATE memories SET fact = ? WHERE id = ?;",
+            (normalized_fact, memory_id),
+        )
+        conn.commit()
+
+    vector_store = get_vector_store()
+    vector_store.delete(ids=[memory_id])
+    vector_store.add_texts(
+        texts=[normalized_fact],
+        ids=[memory_id],
+        metadatas=[{"created_at": created_at}],
+    )
+
+    print(f"[memory] updated: {memory_id}")
+    return {"id": memory_id, "fact": normalized_fact, "created_at": created_at}
+
+
+def delete_memory(memory_id: str) -> bool:
+    """Delete a memory from SQLite and Chroma."""
+    vector_store = get_vector_store()
+    vector_store.delete(ids=[memory_id])
+
+    with _get_connection() as conn:
+        cursor = conn.execute("DELETE FROM memories WHERE id = ?;", (memory_id,))
+        conn.commit()
+
+    deleted = cursor.rowcount > 0
+    if deleted:
+        print(f"[memory] deleted: {memory_id}")
+    return deleted
+
+
 # ── LangGraph state ─────────────────────────────────────────────────────────
 
 
@@ -267,6 +415,25 @@ class AgentState(TypedDict):
 
 
 # ── Graph nodes ──────────────────────────────────────────────────────────────
+
+GEMMA_THOUGHT_BLOCK_RE = re.compile(
+    r"<\|channel\>thought.*?(?:<channel\|>|<\|channel\|>)",
+    re.DOTALL,
+)
+THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+GEMMA_CONTROL_TOKEN_RE = re.compile(
+    r"</?think>|<\|think\|>|<\|channel\>[^<\n]*|<channel\|>|<\|channel\|>"
+)
+
+
+def clean_model_text(content: object) -> str:
+    """Remove model-internal thinking markers from local Gemma output."""
+    text = content if isinstance(content, str) else str(content)
+    text = GEMMA_THOUGHT_BLOCK_RE.sub("", text)
+    text = THINK_BLOCK_RE.sub("", text)
+    text = GEMMA_CONTROL_TOKEN_RE.sub("", text)
+    return text.strip()
+
 
 SYSTEM_PROMPT = textwrap.dedent(
     """\
@@ -325,6 +492,7 @@ def agent(state: AgentState) -> dict:
         content=SYSTEM_PROMPT.format(memories=state["current_memories"])
     )
     response: AIMessage = llm.invoke([system] + state["messages"])
+    response.content = clean_model_text(response.content)
     print(f"[node] agent → generated {len(response.content)} chars")
     return {"messages": state["messages"] + [response]}
 
@@ -342,7 +510,7 @@ def memory_reflector(state: AgentState) -> dict:
             HumanMessage(content=exchange),
         ]
     )
-    fact = analysis.content.strip()
+    fact = clean_model_text(analysis.content)
     print(f"[node] memory_reflector → {fact!r}")
 
     if fact.upper() != "NONE" and len(fact) > 2:
@@ -370,6 +538,91 @@ def build_graph() -> StateGraph:
     return graph
 
 
+def _thread_config(thread_id: str) -> dict:
+    """Build LangGraph config for a conversation thread."""
+    return {"configurable": {"thread_id": thread_id}}
+
+
+def get_thread_messages(checkpointer, thread_id: str) -> list[BaseMessage]:
+    """Load checkpointed conversation messages for a thread."""
+    checkpoint = checkpointer.get(_thread_config(thread_id))
+    if checkpoint and "channel_values" in checkpoint:
+        return checkpoint["channel_values"].get("messages", [])
+    return []
+
+
+def run_chat_turn(
+    user_input: str,
+    app,
+    checkpointer,
+    thread_id: str = THREAD_ID,
+) -> str:
+    """Run one mentor turn against a compiled LangGraph app."""
+    past_messages = get_thread_messages(checkpointer, thread_id)
+
+    # Cap conversation history to avoid unbounded token growth.
+    if len(past_messages) > MAX_HISTORY_MESSAGES:
+        past_messages = past_messages[-MAX_HISTORY_MESSAGES:]
+
+    messages = past_messages + [HumanMessage(content=user_input)]
+    result = app.invoke(
+        {"messages": messages, "current_memories": ""},
+        config=_thread_config(thread_id),
+    )
+
+    return clean_model_text(result["messages"][-1].content)
+
+
+def message_to_dict(message: BaseMessage) -> dict[str, str]:
+    """Serialize a LangChain message for the web UI."""
+    if isinstance(message, HumanMessage):
+        role = "user"
+    elif isinstance(message, AIMessage):
+        role = "assistant"
+    else:
+        role = message.type
+    return {"role": role, "content": clean_model_text(message.content)}
+
+
+class MentorRuntime:
+    """Long-lived compiled graph runtime shared by CLI or web UI."""
+
+    def __init__(self, default_thread_id: str = THREAD_ID) -> None:
+        self.default_thread_id = default_thread_id
+        self._checkpointer_context = None
+        self.checkpointer = None
+        self.app = None
+
+    def __enter__(self) -> "MentorRuntime":
+        self._checkpointer_context = SqliteSaver.from_conn_string(DB_PATH)
+        self.checkpointer = self._checkpointer_context.__enter__()
+        self.app = build_graph().compile(checkpointer=self.checkpointer)
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        if self._checkpointer_context is not None:
+            self._checkpointer_context.__exit__(exc_type, exc, traceback)
+
+    def reply(self, user_input: str, thread_id: str | None = None) -> str:
+        if self.app is None or self.checkpointer is None:
+            raise RuntimeError("MentorRuntime must be used as a context manager.")
+        return run_chat_turn(
+            user_input=user_input,
+            app=self.app,
+            checkpointer=self.checkpointer,
+            thread_id=thread_id or self.default_thread_id,
+        )
+
+    def history(self, thread_id: str | None = None) -> list[dict[str, str]]:
+        if self.checkpointer is None:
+            raise RuntimeError("MentorRuntime must be used as a context manager.")
+        messages = get_thread_messages(
+            self.checkpointer,
+            thread_id or self.default_thread_id,
+        )
+        return [message_to_dict(message) for message in messages]
+
+
 # ── Main loop ────────────────────────────────────────────────────────────────
 
 
@@ -384,6 +637,10 @@ def main() -> None:
               python agent.py --backfill   # Run backfill maintenance and start chatbot
               
             Environment variables:
+              MODEL_NAME                 - Ollama chat model (default: gemma4:26b)
+              EMBEDDING_MODEL_NAME       - Ollama embedding model (default: nomic-embed-text)
+              OLLAMA_BASE_URL            - Ollama server URL (default: http://localhost:11434)
+              OLLAMA_NUM_CTX             - Context window for local inference (default: 8192)
               ENABLE_BACKFILL_ON_STARTUP - Auto-run backfill on startup (default: false)
               BACKFILL_BATCH_SIZE        - Number of memories per batch (default: 100)
               BACKFILL_RATE_LIMIT_DELAY  - Seconds between batches (default: 1.0)
@@ -397,17 +654,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    try:
+        ensure_local_models_available()
+    except RuntimeError as exc:
+        print(f"[ollama] {exc}", file=sys.stderr)
+        sys.exit(1)
+
     init_db(run_backfill=args.backfill)
 
-    graph = build_graph()
-
-    # SqliteSaver stores LangGraph checkpoints (conversation thread state).
-    # We reuse the same DB file so everything lives in one place.
-    with SqliteSaver.from_conn_string(DB_PATH) as checkpointer:
-        app = graph.compile(checkpointer=checkpointer)
-
-        config = {"configurable": {"thread_id": THREAD_ID}}
-
+    with MentorRuntime() as mentor:
         print("\n🎓  Personal Mentor is ready.  Type 'exit' to quit.\n")
 
         while True:
@@ -423,26 +678,7 @@ def main() -> None:
                 print("Goodbye! 👋")
                 break
 
-            # Retrieve the latest checkpoint so we carry forward history.
-            checkpoint = checkpointer.get(config)
-            past_messages: list[BaseMessage] = []
-            if checkpoint and "channel_values" in checkpoint:
-                past_messages = checkpoint["channel_values"].get("messages", [])
-
-            # Cap conversation history to avoid unbounded token growth.
-            if len(past_messages) > MAX_HISTORY_MESSAGES:
-                past_messages = past_messages[-MAX_HISTORY_MESSAGES:]
-
-            # Append the new human message.
-            messages = past_messages + [HumanMessage(content=user_input)]
-
-            result = app.invoke(
-                {"messages": messages, "current_memories": ""},
-                config=config,
-            )
-
-            # The last message in the result is the assistant reply.
-            assistant_reply = result["messages"][-1].content
+            assistant_reply = mentor.reply(user_input)
             print(f"\nMentor: {assistant_reply}\n")
 
 

@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Coach</title>
+    <link rel="stylesheet" href="/styles.css?v=2" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Coach controls">
+        <div class="brand">
+          <img src="/assets/coach-mark.svg" alt="" class="brand-mark" />
+          <div>
+            <h1>Coach</h1>
+            <p>Gemma 4 26B-A4B</p>
+          </div>
+        </div>
+
+        <section class="panel status-panel" aria-live="polite">
+          <div class="panel-label">Runtime</div>
+          <div class="status-line">
+            <span class="status-dot" id="statusDot"></span>
+            <span id="statusText">Checking local model</span>
+          </div>
+          <div class="setup-text" id="setupText"></div>
+        </section>
+
+        <section class="panel thread-panel">
+          <label for="threadId">Thread</label>
+          <div class="thread-row">
+            <input id="threadId" name="threadId" autocomplete="off" />
+            <button class="icon-button" id="newThread" type="button" title="New thread" aria-label="New thread">
+              +
+            </button>
+          </div>
+        </section>
+
+        <section class="panel memory-panel">
+          <div class="panel-header">
+            <h2>Recent Memories</h2>
+            <button class="icon-button" id="refreshMemories" type="button" title="Refresh memories" aria-label="Refresh memories">
+              ↻
+            </button>
+          </div>
+          <div class="memory-list" id="memoryList"></div>
+        </section>
+      </aside>
+
+      <main class="chat-shell">
+        <header class="chat-header">
+          <div>
+            <p class="eyebrow">Local mentor</p>
+            <h2>What would you like to work through?</h2>
+          </div>
+          <div class="model-pill" id="modelPill">gemma4:26b</div>
+        </header>
+
+        <section class="messages" id="messages" aria-live="polite"></section>
+
+        <div class="prompt-strip" id="promptStrip">
+          <button type="button" data-prompt="Help me clarify the goal I should focus on this week.">Clarify a goal</button>
+          <button type="button" data-prompt="I am avoiding something important. Help me unpack why.">Unpack avoidance</button>
+          <button type="button" data-prompt="Help me turn a vague ambition into one concrete next step.">Find next step</button>
+        </div>
+
+        <form class="composer" id="composer">
+          <textarea
+            id="messageInput"
+            name="message"
+            rows="1"
+            placeholder="Write to Coach"
+            autocomplete="off"
+          ></textarea>
+          <button class="send-button" id="sendButton" type="submit" title="Send" aria-label="Send">
+            →
+          </button>
+        </form>
+      </main>
+    </div>
+
+    <script src="/app.js?v=2"></script>
+  </body>
+</html>
