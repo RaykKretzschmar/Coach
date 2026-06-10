@@ -12,7 +12,12 @@ import atexit
 import importlib
 import json
 import mimetypes
+import os
+import signal
+import shutil
+import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -25,8 +30,10 @@ DEFAULT_PORT = 8765
 
 _agent_module = None
 _runtime = None
+_ollama_process = None
 _runtime_lock = threading.Lock()
 _chat_lock = threading.Lock()
+_ollama_lock = threading.Lock()
 
 
 def _json_bytes(payload: dict, status: int = 200) -> tuple[int, bytes]:
@@ -38,6 +45,35 @@ def _load_agent_module():
     if _agent_module is None:
         _agent_module = importlib.import_module("agent")
     return _agent_module
+
+
+def _ollama_binary_path() -> str | None:
+    configured_path = os.getenv("OLLAMA_BIN")
+    candidates = [
+        configured_path,
+        "/Applications/Ollama.app/Contents/Resources/ollama",
+        shutil.which("ollama"),
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    return None
+
+
+def _ollama_model_names(timeout: float = 2.0) -> set[str]:
+    agent = _load_agent_module()
+    request = agent.Request(agent._ollama_api_url("/api/tags"), method="GET")
+    with agent.urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return {model.get("name", "") for model in payload.get("models", [])}
+
+
+def _ollama_running() -> bool:
+    try:
+        _ollama_model_names(timeout=1.0)
+    except Exception:
+        return False
+    return True
 
 
 def _agent_setup_status() -> dict:
@@ -54,7 +90,7 @@ def _agent_setup_status() -> dict:
     installed_models: set[str] = set()
     ollama_error = None
     try:
-        installed_models = agent._get_installed_ollama_models()
+        installed_models = _ollama_model_names()
     except Exception as exc:
         ollama_error = str(exc)
 
@@ -62,13 +98,24 @@ def _agent_setup_status() -> dict:
     missing_models = [
         model
         for model in required_models
-        if not agent.is_ollama_model_installed(model, installed_models)
+        if ollama_error is None
+        and not agent.is_ollama_model_installed(model, installed_models)
     ]
+    ollama_running = ollama_error is None
+
+    if ollama_running and not missing_models:
+        stage = "ready"
+    elif not ollama_running:
+        stage = "stopped"
+    else:
+        stage = "ollama"
 
     return {
-        "ok": ollama_error is None and not missing_models,
-        "stage": "ready" if ollama_error is None and not missing_models else "ollama",
-        "error": ollama_error,
+        "ok": stage == "ready",
+        "stage": stage,
+        "error": None if stage == "stopped" else ollama_error,
+        "ollama_running": ollama_running,
+        "ollama_binary": _ollama_binary_path(),
         "missing_models": missing_models,
         "pull_commands": [f"ollama pull {model}" for model in missing_models],
         "model": agent.MODEL_NAME,
@@ -97,6 +144,83 @@ def _close_runtime() -> None:
         _runtime = None
 
 
+def _ollama_listener_pids() -> list[int]:
+    result = subprocess.run(
+        ["lsof", "-tiTCP:11434", "-sTCP:LISTEN"],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    pids: list[int] = []
+    for line in result.stdout.splitlines():
+        try:
+            pids.append(int(line.strip()))
+        except ValueError:
+            continue
+    return pids
+
+
+def _start_ollama_server() -> dict:
+    global _ollama_process
+    with _ollama_lock:
+        if _ollama_running():
+            return {"started": False, "status": _agent_setup_status()}
+
+        binary_path = _ollama_binary_path()
+        if binary_path is None:
+            raise RuntimeError("Ollama binary was not found.")
+
+        _ollama_process = subprocess.Popen(
+            [binary_path, "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if _ollama_running():
+                return {"started": True, "status": _agent_setup_status()}
+            if _ollama_process.poll() is not None:
+                break
+            time.sleep(0.5)
+
+        raise RuntimeError("Ollama did not start within 20 seconds.")
+
+
+def _stop_ollama_server() -> dict:
+    global _ollama_process
+    with _ollama_lock:
+        _close_runtime()
+
+        pids = _ollama_listener_pids()
+        if _ollama_process is not None and _ollama_process.poll() is None:
+            pids.append(_ollama_process.pid)
+
+        for pid in sorted(set(pids)):
+            if pid == os.getpid():
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and _ollama_running():
+            time.sleep(0.25)
+
+        for pid in sorted(set(pids)):
+            if pid == os.getpid():
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                continue
+
+        _ollama_process = None
+        return {"stopped": True, "status": _agent_setup_status()}
+
+
 atexit.register(_close_runtime)
 
 
@@ -120,6 +244,12 @@ class CoachHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/chat":
             self._handle_chat()
+            return
+        if parsed.path == "/api/ollama/start":
+            self._handle_ollama_start()
+            return
+        if parsed.path == "/api/ollama/stop":
+            self._handle_ollama_stop()
             return
         self.send_error(404, "Not found")
 
@@ -234,6 +364,18 @@ class CoachHandler(BaseHTTPRequestHandler):
             self._send_json({"deleted": True, "memories": memories})
         except ValueError as exc:
             self._send_json({"error": str(exc)}, 400)
+        except Exception as exc:
+            self._send_json({"error": str(exc), "status": _agent_setup_status()}, 500)
+
+    def _handle_ollama_start(self) -> None:
+        try:
+            self._send_json(_start_ollama_server())
+        except Exception as exc:
+            self._send_json({"error": str(exc), "status": _agent_setup_status()}, 500)
+
+    def _handle_ollama_stop(self) -> None:
+        try:
+            self._send_json(_stop_ollama_server())
         except Exception as exc:
             self._send_json({"error": str(exc), "status": _agent_setup_status()}, 500)
 

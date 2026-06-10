@@ -2,6 +2,8 @@ const els = {
   statusDot: document.querySelector("#statusDot"),
   statusText: document.querySelector("#statusText"),
   setupText: document.querySelector("#setupText"),
+  startOllama: document.querySelector("#startOllama"),
+  stopOllama: document.querySelector("#stopOllama"),
   modelPill: document.querySelector("#modelPill"),
   threadId: document.querySelector("#threadId"),
   newThread: document.querySelector("#newThread"),
@@ -16,6 +18,8 @@ const els = {
 
 const STORAGE_KEY = "coach.threadId";
 let currentMemories = [];
+let runtimeReady = false;
+let isSending = false;
 
 function defaultThreadId() {
   return localStorage.getItem(STORAGE_KEY) || "default-thread";
@@ -85,12 +89,23 @@ function setStatus(kind, text, lines = []) {
   renderSetupLines(lines);
 }
 
+function updateRuntimeControls(status) {
+  runtimeReady = Boolean(status?.ok);
+  const isRunning = Boolean(status?.ollama_running);
+  els.startOllama.disabled = isRunning || !status?.ollama_binary;
+  els.stopOllama.disabled = !isRunning;
+  updateSendState();
+}
+
 async function loadStatus() {
   try {
     const status = await api("/api/status");
     els.modelPill.textContent = status.model || "gemma4:26b";
+    updateRuntimeControls(status);
     if (status.ok) {
       setStatus("ready", "Ready");
+    } else if (status.stage === "stopped") {
+      setStatus(null, "Ollama stopped", ["Start the local model server when you need Coach."]);
     } else if (status.stage === "python") {
       setStatus("error", "Setup needed", [status.hint, status.error]);
     } else {
@@ -101,6 +116,7 @@ async function loadStatus() {
       setStatus("error", "Local model unavailable", lines);
     }
   } catch (error) {
+    updateRuntimeControls({ ok: false, ollama_running: false, ollama_binary: null });
     setStatus("error", "Status unavailable", [error.message]);
   }
 }
@@ -272,9 +288,14 @@ async function loadMemories() {
   }
 }
 
-function setSending(isSending) {
-  els.sendButton.disabled = isSending;
+function updateSendState() {
+  els.sendButton.disabled = isSending || !runtimeReady;
   els.messageInput.disabled = isSending;
+}
+
+function setSending(nextSending) {
+  isSending = nextSending;
+  updateSendState();
   els.sendButton.textContent = isSending ? "…" : "→";
 }
 
@@ -351,6 +372,34 @@ els.newThread.addEventListener("click", () => {
 });
 
 els.refreshMemories.addEventListener("click", loadMemories);
+
+els.startOllama.addEventListener("click", async () => {
+  els.startOllama.disabled = true;
+  setStatus(null, "Starting Ollama", ["Loading the local model server."]);
+  try {
+    const payload = await api("/api/ollama/start", { method: "POST" });
+    updateRuntimeControls(payload.status);
+    await loadStatus();
+  } catch (error) {
+    const status = error.payload?.status;
+    if (status) updateRuntimeControls(status);
+    setStatus("error", "Start failed", [error.message]);
+  }
+});
+
+els.stopOllama.addEventListener("click", async () => {
+  els.stopOllama.disabled = true;
+  setStatus(null, "Stopping Ollama", ["Releasing the local model server."]);
+  try {
+    const payload = await api("/api/ollama/stop", { method: "POST" });
+    updateRuntimeControls(payload.status);
+    await loadStatus();
+  } catch (error) {
+    const status = error.payload?.status;
+    if (status) updateRuntimeControls(status);
+    setStatus("error", "Stop failed", [error.message]);
+  }
+});
 
 els.memoryList.addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-action]");

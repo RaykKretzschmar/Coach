@@ -43,7 +43,8 @@ MODEL_TEMPERATURE = float(os.getenv("MODEL_TEMPERATURE", "1.0"))
 OLLAMA_TOP_P = float(os.getenv("OLLAMA_TOP_P", "0.95"))
 OLLAMA_TOP_K = int(os.getenv("OLLAMA_TOP_K", "64"))
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
-OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "1024"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "2048"))
+OLLAMA_CONTINUATION_ATTEMPTS = int(os.getenv("OLLAMA_CONTINUATION_ATTEMPTS", "2"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 SKIP_OLLAMA_MODEL_CHECK = os.getenv("SKIP_OLLAMA_MODEL_CHECK", "false").lower() in (
     "true",
@@ -59,7 +60,7 @@ DEDUP_THRESHOLD = float(
 )  # similarity above this → duplicate
 MAX_HISTORY_MESSAGES = int(
     os.getenv("MAX_HISTORY_MESSAGES", "20")
-)  # conversation history cap
+)  # recent messages sent to the model; full app history is preserved
 ENABLE_BACKFILL_ON_STARTUP = os.getenv(
     "ENABLE_BACKFILL_ON_STARTUP", "false"
 ).lower() in (
@@ -424,6 +425,11 @@ THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 GEMMA_CONTROL_TOKEN_RE = re.compile(
     r"</?think>|<\|think\|>|<\|channel\>[^<\n]*|<channel\|>|<\|channel\|>"
 )
+LENGTH_STOP_REASONS = {"length", "max_tokens", "max_tokens_reached"}
+CONTINUE_PROMPT = (
+    "Continue the previous answer from exactly where it stopped. "
+    "Do not restart, summarize, or add a preface."
+)
 
 
 def clean_model_text(content: object) -> str:
@@ -433,6 +439,78 @@ def clean_model_text(content: object) -> str:
     text = THINK_BLOCK_RE.sub("", text)
     text = GEMMA_CONTROL_TOKEN_RE.sub("", text)
     return text.strip()
+
+
+def _length_stop_reason(message: AIMessage) -> str | None:
+    """Return the provider stop reason when output hit a length limit."""
+    metadata = getattr(message, "response_metadata", {}) or {}
+    for key in ("done_reason", "finish_reason", "stop_reason"):
+        reason = metadata.get(key)
+        if isinstance(reason, str) and reason.lower() in LENGTH_STOP_REASONS:
+            return reason
+    return None
+
+
+def _join_continuation(existing: str, continuation: str) -> str:
+    """Append continuation text while trimming repeated overlap."""
+    existing_text = existing.rstrip()
+    next_text = continuation.strip()
+    if not next_text:
+        return existing_text
+
+    max_overlap = min(len(existing_text), len(next_text), 500)
+    for size in range(max_overlap, 20, -1):
+        if existing_text[-size:] == next_text[:size]:
+            return existing_text + next_text[size:]
+
+    if existing_text and existing_text[-1].isalnum() and next_text[0].isalnum():
+        return f"{existing_text} {next_text}"
+    if existing_text and existing_text[-1] in ".?!)]\"'":
+        return f"{existing_text}\n\n{next_text}"
+    return existing_text + next_text
+
+
+def _recent_messages_for_model(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Keep the model context bounded without truncating stored chat history."""
+    if MAX_HISTORY_MESSAGES <= 0 or len(messages) <= MAX_HISTORY_MESSAGES:
+        return messages
+    return messages[-MAX_HISTORY_MESSAGES:]
+
+
+def invoke_with_auto_continuation(
+    llm: ChatOllama,
+    messages: list[BaseMessage],
+) -> AIMessage:
+    """Generate a reply and continue if Ollama reports a length stop."""
+    response: AIMessage = llm.invoke(messages)
+    response.content = clean_model_text(response.content)
+    continuation_count = 0
+
+    while (
+        continuation_count < OLLAMA_CONTINUATION_ATTEMPTS
+        and _length_stop_reason(response)
+    ):
+        continuation_count += 1
+        continuation: AIMessage = llm.invoke(
+            messages
+            + [
+                AIMessage(content=response.content),
+                HumanMessage(content=CONTINUE_PROMPT),
+            ]
+        )
+        continuation_text = clean_model_text(continuation.content)
+        if not continuation_text:
+            break
+        response.content = _join_continuation(response.content, continuation_text)
+        response.response_metadata = {
+            **(response.response_metadata or {}),
+            "coach_continuations": continuation_count,
+            "last_continuation_reason": _length_stop_reason(continuation),
+        }
+        if not _length_stop_reason(continuation):
+            break
+
+    return response
 
 
 SYSTEM_PROMPT = textwrap.dedent(
@@ -491,9 +569,15 @@ def agent(state: AgentState) -> dict:
     system = SystemMessage(
         content=SYSTEM_PROMPT.format(memories=state["current_memories"])
     )
-    response: AIMessage = llm.invoke([system] + state["messages"])
-    response.content = clean_model_text(response.content)
-    print(f"[node] agent → generated {len(response.content)} chars")
+    model_messages = _recent_messages_for_model(state["messages"])
+    response = invoke_with_auto_continuation(llm, [system] + model_messages)
+    continuation_count = (response.response_metadata or {}).get(
+        "coach_continuations", 0
+    )
+    continuation_label = (
+        f", continued {continuation_count} time(s)" if continuation_count else ""
+    )
+    print(f"[node] agent → generated {len(response.content)} chars{continuation_label}")
     return {"messages": state["messages"] + [response]}
 
 
@@ -559,11 +643,6 @@ def run_chat_turn(
 ) -> str:
     """Run one mentor turn against a compiled LangGraph app."""
     past_messages = get_thread_messages(checkpointer, thread_id)
-
-    # Cap conversation history to avoid unbounded token growth.
-    if len(past_messages) > MAX_HISTORY_MESSAGES:
-        past_messages = past_messages[-MAX_HISTORY_MESSAGES:]
-
     messages = past_messages + [HumanMessage(content=user_input)]
     result = app.invoke(
         {"messages": messages, "current_memories": ""},

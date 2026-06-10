@@ -48,6 +48,7 @@ MODEL_NAME=gemma4:26b
 EMBEDDING_MODEL_NAME=nomic-embed-text
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_NUM_CTX=8192
+OLLAMA_NUM_PREDICT=2048
 ```
 
 Optional environment variables:
@@ -61,7 +62,8 @@ Optional environment variables:
 | `OLLAMA_TOP_P` | `0.95` | Chat nucleus sampling value |
 | `OLLAMA_TOP_K` | `64` | Chat top-k sampling value |
 | `OLLAMA_NUM_CTX` | `8192` | Context window used for local inference |
-| `OLLAMA_NUM_PREDICT` | `1024` | Max generated tokens per response |
+| `OLLAMA_NUM_PREDICT` | `2048` | Max generated tokens per response before continuation handling |
+| `OLLAMA_CONTINUATION_ATTEMPTS` | `2` | Extra generation passes when Ollama reports that an answer hit the length limit |
 | `OLLAMA_KEEP_ALIVE` | `10m` | How long Ollama should keep the model loaded after use |
 | `SKIP_OLLAMA_MODEL_CHECK` | `false` | Skip startup validation for installed local models |
 | `MENTOR_DB` | `mentor.db` | Path to the SQLite database |
@@ -70,7 +72,7 @@ Optional environment variables:
 | `CHROMA_COLLECTION` | `memories_local` | Chroma collection for local embeddings |
 | `MEMORY_TOP_K` | `10` | Max memories retrieved per turn |
 | `DEDUP_THRESHOLD` | `0.92` | Similarity score above which a memory is considered a duplicate |
-| `MAX_HISTORY_MESSAGES` | `20` | Conversation history cap (prevents unbounded token growth) |
+| `MAX_HISTORY_MESSAGES` | `20` | Recent conversation messages sent to the model each turn; full app history is preserved |
 | `ENABLE_BACKFILL_ON_STARTUP` | `false` | Auto-run vector store backfill on startup |
 | `BACKFILL_BATCH_SIZE` | `100` | Memories per backfill batch |
 | `BACKFILL_RATE_LIMIT_DELAY` | `1.0` | Seconds between backfill batches |
